@@ -1,0 +1,12 @@
+#!/bin/sh
+n=$1
+shift
+
+export PARALLEL=yes
+export vcpus=2
+export net_admin=192.168.$((150+$n*2))
+export net_public=192.168.$((151+$n*2))
+export adminnetmask=255.255.254.0
+export virtualcloud=c$n
+export cloud=$virtualcloud
+export cloudvg=libvirt

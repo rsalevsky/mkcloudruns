@@ -35,4 +35,4 @@ allocated_cloud=1
 
 . ../runtestn ${allocated_cloud}
 
-exec ../automation/scripts/mkcloud "$@"
+exec ../../automation/scripts/mkcloud "$@"

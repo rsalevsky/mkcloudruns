@@ -8,7 +8,12 @@ mkcconf=mkcloud.config
 
 novacontroller=
 novadashboardserver=
+clusternodesdata=
+clusternodesnetwork=
+clusternodesservices=
+
 export cloud=${1}
+shift
 export cloudfqdn=${cloudfqdn:-$cloud.cloud.suse.de}
 export nodenumber=${nodenumber:-2}
 export tempestoptions=${tempestoptions:--t -s}
@@ -19,6 +24,7 @@ export cinder_conf_volume_type=${cinder_conf_volume_type:-""}
 export cinder_conf_volume_params=${cinder_conf_volume_params:-""}
 export localreposdir_target=${localreposdir_target:-""}
 export want_ipmi=${want_ipmi:-false}
+[ "$libvirt_type" = hyperv ] && export wanthyperv=1
 
 [ -e /etc/profile.d/crowbar.sh ] && . /etc/profile.d/crowbar.sh
 
@@ -142,6 +148,7 @@ vlan_sdn=${vlan_sdn:-$vlan_storage}
 net_fixed=${net_fixed:-192.168.123}
 net_public=${net_public:-192.168.122}
 net_storage=${net_storage:-192.168.125}
+mkcloudhostip=${net}.1
 
 # run hook code before the actual script does its function
 function pre_hook()
@@ -284,13 +291,13 @@ function iscloudver()
     fi
     case "$v" in
         3)
-            [[ $cloudsource =~ ^.+3(\+up)$ ]]
+            [[ $cloudsource =~ ^.*(cloud|GM)3(\+up)?$ ]]
             ;;
         4)
-            [[ $cloudsource =~ ^.+4(\+up)?$ ]]
+            [[ $cloudsource =~ ^.*(cloud|GM)4(\+up)?$ ]]
             ;;
         5)
-            [[ $cloudsource =~ ^(.+5|M[[:digit:]]+|Beta[[:digit:]]+|GM5?)$ ]]
+            [[ $cloudsource =~ ^(.+5|M[[:digit:]]+|Beta[[:digit:]]+|RC[[:digit:]]*|GMC[[:digit:]]*|GM5?)$ ]]
             ;;
         *)
             return 1
@@ -347,6 +354,9 @@ function add_ha_repo()
 {
     local repo
     for repo in "SLE11-HAE-SP3-Pool" "SLE11-HAE-SP3-Updates" "SLE11-HAE-SP3-Updates-test" ; do
+        if [ "$hacloud" == "2" && "$repo" == "SLE11-HAE-SP3-Updates-test" ] ; then
+            continue
+        fi
         add_mount "" "clouddata.cloud.suse.de:/srv/nfs/repos/$repo" "/srv/tftpboot/repos/$repo"
     done
 }
@@ -355,14 +365,72 @@ function add_suse_storage_repo()
 {
     if [ -n "$want_sles12" ] && iscloudver 5plus ; then
         local repo
-        for repo  in "SUSE-Storage-1.0-Pool" "SUSE-Storage-1.0-Updates"; do
+        for repo  in "SUSE-Enterprise-Storage-1.0-Pool" "SUSE-Enterprise-Storage-1.0-Updates"; do
             add_mount "$repo" "clouddata.cloud.suse.de:/srv/nfs/repos/$repo" "/srv/tftpboot/repos/$repo"
         done
     else
-        echo "Error: You need SLE12 and SUSE-Cloud5 to setup SUSE Cloud Storage."
+        echo "Error: You need SLE12 and SUSE Cloud >= 5 to setup storage repos."
     fi
 }
 
+function cluster_node_assignment()
+{
+    local L
+    L=`crowbar machines list | grep -v crowbar`
+
+    # the nodes that contain drbd volumes are defined via drbdnode_mac_vol
+    for dmachine in ${drbdnode_mac_vol//+/ } ; do
+        local mac
+        local serial
+        mac=${dmachine%#*}
+        serial=${dmachine#*#}
+
+        # find and remove drbd nodes from L
+        for node in $L ; do
+            if crowbar machines show "$node" | grep "\"macaddress\"" | grep -qi $mac ; then
+                clusternodesdata="$clusternodesdata $node"
+
+                # assign drbd volume via knife
+                local nfile
+                nfile=knife.node.${node}.json
+                knife node show ${node} -F json > $nfile
+                $ruby -e "require 'rubygems';require 'json';
+                            j=JSON.parse(STDIN.read);
+                            j['normal']['crowbar_wall']['claimed_disks'].each do |k,v|
+                                next if v.is_a? Hash and v['owner'] !~ /LVM_DRBD/;
+                                j['normal']['crowbar_wall']['claimed_disks'].delete(k);
+                            end ;
+                            j['normal']['crowbar_wall']['claimed_disks']['/dev/disk/by-id/$serial']={'owner' => 'LVM_DRBD'};
+                            puts JSON.pretty_generate(j)" < $nfile > ${nfile}.tmp
+                mv ${nfile}.tmp ${nfile}
+                knife node from file ${nfile}
+            fi
+        done
+        for dnode in $clusternodesdata ; do
+            L=`printf "%s\n" $L | grep -iv $dnode`
+        done
+    done
+
+    # assign nodes to clusters
+    clusternodesnetwork=`printf  "%s\n" $L | head -n$nodenumbernetworkcluster`
+    clusternodesservices=`printf "%s\n" $L | tail -n$nodenumberservicescluster`
+
+    for n in $clusternodesnetwork $clusternodesservices ; do
+        L=`printf "%s\n" $L | grep -iv $n`
+    done
+    nodescompute=$L
+    echo "............................................................"
+    echo "The cluster node assignment (for your information):"
+    echo "data cluster:"
+    printf "   %s\n" $clusternodesdata
+    echo "network cluster:"
+    printf "   %s\n" $clusternodesnetwork
+    echo "services cluster:"
+    printf "   %s\n" $clusternodesservices
+    echo "compute nodes (no cluster):"
+    printf "   %s\n" $L
+    echo "............................................................"
+}
 
 function onadmin_prepare_sles_repos()
 {
@@ -748,7 +816,7 @@ function do_installcrowbar()
     # run in screen to not lose session in the middle when network is reconfigured:
     screen -d -m -L /bin/bash -c "$instcmd ; touch /tmp/chef-ready"
 
-    if [ "$libvirt_type" = hyperv ] ; then
+    if [ -n "$wanthyperv" ] ; then
         # prepare Hyper-V 2012 R2 PXE-boot env and export it via Samba:
         zypper -n in samba
         rsync -a clouddata.cloud.suse.de::cloud/hyperv-6.3 /srv/tftpboot/
@@ -813,12 +881,14 @@ EOF
         exit 67
     fi
     if [ -n "$ntpserver" ] ; then
+        local pfile=`get_proposal_filename ntp default`
         crowbar ntp proposal show default |
             $ruby -e "require 'rubygems';require 'json';
-    j=JSON.parse(STDIN.read);
-    j['attributes']['ntp']['external_servers']=['$ntpserver'];
-        puts JSON.pretty_generate(j)" > /root/ntpproposal
-        crowbar ntp proposal --file=/root/ntpproposal edit default
+            j=JSON.parse(STDIN.read);
+            j['attributes']['ntp']['external_servers']=['$ntpserver'];
+            puts JSON.pretty_generate(j)" > $pfile
+        crowbar ntp proposal --file=$pfile edit default
+        rm -f $pfile
         crowbar ntp proposal commit default
     fi
 
@@ -840,6 +910,21 @@ function onadmin_installcrowbar()
     do_installcrowbar "if [ -e /tmp/install-chef-suse.sh ] ; then /tmp/install-chef-suse.sh --verbose ; else /opt/dell/bin/install-chef-suse.sh --verbose ; fi"
 }
 
+# set a node's role and platform
+# must be run after discovery and before allocation
+function set_node_role_and_platform()
+{
+    node="$1"
+    role="$2"
+    platform="$3"
+    local t=$(mktemp).json
+    knife node show -F json "$node" > $t
+    json-edit $t -a normal.crowbar_wall.intended_role -v "$role"
+    json-edit $t -a normal.target_platform -v "$platform"
+    knife node from file $t
+    rm -f $t
+}
+
 function onadmin_allocate()
 {
     pre_hook $FUNCNAME
@@ -856,6 +941,7 @@ function onadmin_allocate()
             for pw in 'cr0wBar!' $extraipmipw ; do
                 local ip=$bmc_net.$(($ip4 + $i))
                 (ipmitool -H $ip -U root -P $pw lan set 1 defgw ipaddr "$bmc_net.1"
+                ipmitool -H $ip -U root -P $pw power on
                 ipmitool -H $ip -U root -P $pw power reset) &
             done
         done
@@ -887,23 +973,17 @@ function onadmin_allocate()
         local nodes=( $(crowbar machines list | LC_ALL=C sort | grep ^d | tail -n 2) )
         if [ -n "$wantceph" ] ; then
             echo "Setting second last node to SLE12 Storage..."
-
-            local t=$(mktemp).json
-            knife node show -F json $nodes[1] > $t
-            json-edit $t -a normal.crowbar_wall.intended_role -v "storage"
-            json-edit $t -a normal.target_platform -v "suse-12.0"
-            knife node from file $t
-            rm -f $t
+            set_node_role_and_platform ${nodes[0]} "storage" "suse-12.0"
         fi
 
         echo "Setting last node to SLE12 compute..."
-        local t=$(mktemp).json
+        set_node_role_and_platform ${nodes[1]} "compute" "suse-12.0"
+    fi
 
-        knife node show -F json $nodes[2] > $t
-        json-edit $t -a normal.crowbar_wall.intended_role -v "compute"
-        json-edit $t -a normal.target_platform -v "suse-12.0"
-        knife node from file $t
-        rm -f $t
+    if [ -n "$wanthyperv" ] ; then
+        echo "Setting last node to Hyper-V compute..."
+        local computenode=$(crowbar machines list | LC_ALL=C sort | grep ^d | tail -n 1)
+        set_node_role_and_platform $computenode "compute" "hyperv-6.3"
     fi
 
     echo "Allocating nodes..."
@@ -920,6 +1000,8 @@ function onadmin_allocate()
     if grep -q "Exception caught" /root/crowbartest.out; then
         exit 27
     fi
+
+    rm -f /root/crowbartest.out
 }
 
 function sshtest()
@@ -948,7 +1030,7 @@ function onadmin_waitcompute()
     pre_hook $FUNCNAME
     local node
     for node in $(crowbar machines list | grep ^d) ; do
-        wait_for 180 10 "sshtest $node rpm -q yast2-core" "node $node" "check_node_resolvconf $node; exit 12"
+        wait_for 180 10 "netcat -w 3 -z $node 3389 || sshtest $node rpm -q yast2-core" "node $node" "check_node_resolvconf $node; exit 12"
         echo "node $node ready"
     done
 }
@@ -976,7 +1058,7 @@ function waitnodes()
                     n=$((n-1))
                     echo -n "."
                 done
-                n=500 ; while test $n -gt 0 && ! netcat -z $i 22 ; do
+                n=500 ; while test $n -gt 0 && ! netcat -w 3 -z $i 22 && ! netcat -w 3 -z $i 3389  ; do
                     sleep 1
                     n=$(($n - 1))
                     echo -n "."
@@ -1013,6 +1095,10 @@ function waitnodes()
     fi
 }
 
+function get_proposal_filename()
+{
+    echo "/root/${1}.${2}.proposal"
+}
 
 # generic function to modify values in proposals
 #   Note: strings have to be quoted like this: "'string'"
@@ -1025,14 +1111,13 @@ function proposal_modify_value()
     local value="$4"
     local operator="${5:-=}"
 
-    local pfile=/root/${proposal}.${proposaltype}.proposal
+    local pfile=`get_proposal_filename "${proposal}" "${proposaltype}"`
 
-    crowbar $proposal proposal show $proposaltype |
-        $ruby -e "require 'rubygems';require 'json';
+    $ruby -e   "require 'rubygems';require 'json';
                 j=JSON.parse(STDIN.read);
                 j${variable}${operator}${value};
-                puts JSON.pretty_generate(j)" > $pfile
-    crowbar $proposal proposal --file=$pfile edit $proposaltype
+                puts JSON.pretty_generate(j)" < $pfile > ${pfile}.tmp
+    mv ${pfile}.tmp ${pfile}
 }
 
 # wrapper for proposal_modify_value
@@ -1077,6 +1162,56 @@ function enable_ssl_for_nova_dashboard()
     proposal_set_value nova_dashboard default "['attributes']['nova_dashboard']['ssl_no_verify']" true
 }
 
+function hacloud_configure_cluster_defaults()
+{
+    clustertype=$1
+    shift
+
+    nodes=`printf "\"%s\"," $@`
+    nodes="[ ${nodes%,} ]"
+    proposal_set_value pacemaker "$clustertype" "['deployment']['pacemaker']['elements']['pacemaker-cluster-member']" "$nodes"
+
+    if [[ "configuration" = "with per_node" ]] ; then
+        for node in $@; do
+            proposal_set_value pacemaker "$clustertype" "['attributes']['pacemaker']['stonith']['per_node']['nodes']['$node']" "{}"
+            proposal_set_value pacemaker "$clustertype" "['attributes']['pacemaker']['stonith']['per_node']['nodes']['$node']['params']" "''"
+        done
+    fi
+
+    proposal_set_value pacemaker "$clustertype" "['attributes']['pacemaker']['stonith']['mode']" "'libvirt'"
+    proposal_set_value pacemaker "$clustertype" "['attributes']['pacemaker']['stonith']['libvirt']['hypervisor_ip']" "'$mkcloudhostip'"
+    proposal_set_value pacemaker "$clustertype" "['description']" "'Pacemaker $clustertype cluster'"
+}
+
+function hacloud_configure_data_cluster()
+{
+    proposal_set_value pacemaker data "['attributes']['pacemaker']['drbd']['enabled']" true
+    hacloud_configure_cluster_defaults "data" $clusternodesdata
+}
+
+function hacloud_configure_network_cluster()
+{
+    hacloud_configure_cluster_defaults "network" $clusternodesnetwork
+}
+
+function hacloud_configure_services_cluster()
+{
+    hacloud_configure_cluster_defaults "services" $clusternodesservices
+}
+
+function dns_proposal_configuration()
+{
+    local cnumber=`crowbar machines list | wc -l`
+    local cnumber=`expr $cnumber - 1`
+    [[ $cnumber -gt 3 ]] && local local cnumber=3
+    local cmachines=`crowbar machines list | sort | head -n ${cnumber}`
+    local dnsnodes=`echo \"$cmachines\" | sed 's/ /", "/g'`
+    proposal_set_value dns default "['attributes']['dns']['records']" "{}"
+    proposal_set_value dns default "['attributes']['dns']['records']['multi-dns']" "{}"
+    proposal_set_value dns default "['attributes']['dns']['records']['multi-dns']['ips']" "['10.11.12.13']"
+    proposal_set_value dns default "['deployment']['dns']['elements']['dns-server']" "[$dnsnodes]"
+}
+
 
 # configure one crowbar barclamp proposal using global vars as source
 #   does not include proposal create or commit
@@ -1087,26 +1222,49 @@ function custom_configuration()
     local proposal=$1
     local proposaltype=${2:-default}
 
-    local crowbaredit="crowbar $proposal proposal edit $proposaltype"
+    # prepare the proposal file to be edited, it will be read once at the end
+    # So, ONLY edit the $pfile  -  DO NOT call "crowbar $x proposal .*" command
+    local pfile=`get_proposal_filename "${proposal}" "${proposaltype}"`
+    crowbar $proposal proposal show $proposaltype > $pfile
+
     if [[ $debug = 1 && $proposal != swift ]] ; then
-        EDITOR='sed -i -e "s/debug\": false/debug\": true/" -e "s/verbose\": false/verbose\": true/"' $crowbaredit
+        sed -i -e "s/debug\": false/debug\": true/" -e "s/verbose\": false/verbose\": true/" $pfile
     fi
+
+    ### NOTE: ONLY USE proposal_{set,modify}_value functions below this line
+    ###       The edited proposal will be read and imported at the end
+    ###       So, only edit the proposal file, and NOT the proposal itself
+
     case "$proposal" in
+        pacemaker)
+            case $proposaltype in
+                data)
+                    hacloud_configure_data_cluster
+                ;;
+                network)
+                    hacloud_configure_network_cluster
+                ;;
+                services)
+                    hacloud_configure_services_cluster
+                ;;
+            esac
+        ;;
+        database)
+            if [[ $hacloud = 1 ]] ; then
+                proposal_set_value database default "['attributes']['database']['ha']['storage']['mode']" "'drbd'"
+                proposal_set_value database default "['attributes']['database']['ha']['storage']['drbd']['size']" "20"
+                proposal_set_value database default "['deployment']['database']['elements']['database-server']" "['cluster:data']"
+            fi
+        ;;
+        rabbitmq)
+            if [[ $hacloud = 1 ]] ; then
+                proposal_set_value rabbitmq default "['attributes']['rabbitmq']['ha']['storage']['mode']" "'drbd'"
+                proposal_set_value rabbitmq default "['attributes']['rabbitmq']['ha']['storage']['drbd']['size']" "20"
+                proposal_set_value rabbitmq default "['deployment']['rabbitmq']['elements']['rabbitmq-server']" "['cluster:data']"
+            fi
+        ;;
         dns)
-            local cnumber=`crowbar machines list | wc -l`
-            local cnumber=`expr $cnumber - 1`
-            [[ $cnumber -gt 3 ]] && local local cnumber=3
-            local cmachines=`crowbar machines list | LC_ALL=C sort | head -n ${cnumber}`
-            local dnsnodes=`echo \"$cmachines\" | sed 's/ /", "/g'`
-            crowbar dns proposal show default |
-                $ruby -e "require 'rubygems';require 'json';
-                    j=JSON.parse(STDIN.read);
-                    j['attributes']['dns']['records']={};
-                    j['attributes']['dns']['records']['multi-dns']={};
-                    j['attributes']['dns']['records']['multi-dns']['ips']=['10.11.12.13'];
-                    j['deployment']['dns']['elements']['dns-server']=[$dnsnodes];
-                    puts JSON.pretty_generate(j)" > /root/dns.default.proposal
-            crowbar dns proposal --file=/root/dns.default.proposal edit default
+            dns_proposal_configuration
         ;;
         ipmi)
             proposal_set_value ipmi default "['attributes']['ipmi']['bmc_enable']" true
@@ -1119,6 +1277,9 @@ function custom_configuration()
             if iscloudver 4plus ; then
                 proposal_set_value keystone default "['attributes']['keystone']['api']['region']" "'CustomRegion'"
             fi
+            if [[ $hacloud = 1 ]] ; then
+                proposal_set_value keystone default "['deployment']['keystone']['elements']['keystone-server']" "['cluster:services']"
+            fi
         ;;
         glance)
             if [[ $all_with_ssl = 1 || $glance_with_ssl = 1 ]] ; then
@@ -1126,6 +1287,9 @@ function custom_configuration()
             fi
             if [[ -n "$wantceph" ]]; then
                 proposal_set_value glance default "['attributes']['glance']['default_store']" "'rbd'"
+            fi
+            if [[ $hacloud = 1 ]] ; then
+                proposal_set_value glance default "['deployment']['glance']['elements']['glance-server']" "['cluster:services']"
             fi
         ;;
         ceph)
@@ -1136,15 +1300,42 @@ function custom_configuration()
             [ -n "$libvirt_type" ] || libvirt_type='kvm';
             proposal_set_value nova default "['attributes']['nova']['libvirt_type']" "'$libvirt_type'"
             proposal_set_value nova default "['attributes']['nova']['use_migration']" "true"
-            EDITOR="sed -i -e 's/nova-multi-compute-$libvirt_type/nova-multi-compute-xxx/g; s/nova-multi-compute-kvm/nova-multi-compute-$libvirt_type/g; s/nova-multi-compute-xxx/nova-multi-compute-kvm/g'" $crowbaredit # FIXME replace with ruby json to be idempotent
+            [[ "$libvirt_type" = xen ]] && sed -i -e "s/nova-multi-compute-$libvirt_type/nova-multi-compute-xxx/g; s/nova-multi-compute-kvm/nova-multi-compute-$libvirt_type/g; s/nova-multi-compute-xxx/nova-multi-compute-kvm/g" $pfile
 
             if [[ $all_with_ssl = 1 || $nova_with_ssl = 1 ]] ; then
                 enable_ssl_for_nova
+            fi
+            if [[ $hacloud = 1 ]] ; then
+                proposal_set_value nova default "['deployment']['nova']['elements']['nova-multi-controller']" "['cluster:services']"
+
+                # only use remaining nodes as compute nodes, keep cluster nodes dedicated to cluster only
+                local novanodes
+                novanodes=`printf "\"%s\"," $nodescompute`
+                novanodes="[ ${novanodes%,} ]"
+                proposal_set_value nova default "['deployment']['nova']['elements']['nova-multi-compute-${libvirt_type}']" "$novanodes"
             fi
         ;;
         nova_dashboard)
             if [[ $all_with_ssl = 1 || $novadashboard_with_ssl = 1 ]] ; then
                 enable_ssl_for_nova_dashboard
+            fi
+            if [[ $hacloud = 1 ]] ; then
+                proposal_set_value nova_dashboard default "['deployment']['nova_dashboard']['elements']['nova_dashboard-server']" "['cluster:services']"
+            fi
+        ;;
+        heat)
+            if [[ $hacloud = 1 ]] ; then
+                proposal_set_value heat default "['deployment']['heat']['elements']['heat-server']" "['cluster:services']"
+            fi
+        ;;
+        ceilometer)
+            if [[ $hacloud = 1 ]] ; then
+                proposal_set_value ceilometer default "['deployment']['ceilometer']['elements']['ceilometer-server']" "['cluster:services']"
+                proposal_set_value ceilometer default "['deployment']['ceilometer']['elements']['ceilometer-cagent']" "['cluster:services']"
+                local ceilometernodes
+                ceilometernodes=`printf "\"%s\"," $nodescompute`
+                ceilometernodes="[ ${ceilometernodes%,} ]"
+                proposal_set_value ceilometer default "['deployment']['ceilometer']['elements']['ceilometer-agent']" "$ceilometernodes"
             fi
         ;;
         neutron)
@@ -1157,6 +1348,10 @@ function custom_configuration()
             fi
             if [ -n "$networkingplugin" ] ; then
                 proposal_set_value neutron default "['attributes']['neutron']['networking_plugin']" "'$networkingplugin'"
+            fi
+            if [[ $hacloud = 1 ]] ; then
+                proposal_set_value neutron default "['deployment']['neutron']['elements']['neutron-server']" "['cluster:network']"
+                proposal_set_value neutron default "['deployment']['neutron']['elements']['neutron-l3']" "['cluster:network']"
             fi
         ;;
         swift)
@@ -1174,7 +1369,9 @@ function custom_configuration()
         ;;
         cinder)
             if iscloudver 4plus ; then
-                proposal_set_value cinder default "['attributes']['cinder']['enable_v2_api']" "true"
+                if iscloudver 4 ; then
+                    proposal_set_value cinder default "['attributes']['cinder']['enable_v2_api']" "true"
+                fi
 
                 volumes="['attributes']['cinder']['volumes']"
                 proposal_set_value cinder default "${volumes}[0]['${cinder_conf_volume_type}']" "j['attributes']['cinder']['volume_defaults']['${cinder_conf_volume_type}']"
@@ -1213,10 +1410,27 @@ function custom_configuration()
                     done
                 fi
             fi
+            if [[ $hacloud = 1 ]] ; then
+                local cinder_volume
+                # fetch one of the compute nodes as cinder_volume
+                cinder_volume=`printf "%s\n" $nodescompute | tail -n 1`
+                proposal_set_value cinder default "['deployment']['cinder']['elements']['cinder-controller']" "['cluster:services']"
+                proposal_set_value cinder default "['deployment']['cinder']['elements']['cinder-volume']" "['$cinder_volume']"
+            fi
+        ;;
+        tempest)
+            if [[ $hacloud = 1 ]] ; then
+                local tempestnodes
+                tempestnodes=`printf "\"%s\"," $nodescompute`
+                tempestnodes="[ ${tempestnodes%,} ]"
+                proposal_set_value tempest default "['deployment']['tempest']['elements']['tempest']" "$tempestnodes"
+            fi
         ;;
         *) echo "No hooks defined for service: $proposal"
         ;;
     esac
+
+    crowbar $proposal proposal --file=$pfile edit $proposaltype
 }
 
 # set global variables to be used in and after proposal phase
@@ -1227,12 +1441,13 @@ function set_proposalvars()
 
     wantswift=1
     [ -z "$want_swift" ] && wantceph=1
+    [[ -n "$wanthyperv" ]] && wantswift= && wantceph= && networkingmode=vlan
     wanttempest=
-    iscloudver 5plus && wantmultidns=1
     iscloudver 4plus && wanttempest=1
+    [[ "$want_tempest" = 0 ]] && wanttempest=
 
     iscloudver 5 && {
-        echo "WARNING: swift currently disabled, becaus openstack-swift packages for SLES12 are missing"
+        echo "WARNING: swift currently disabled, because openstack-swift packages for SLES12 are missing"
         wantswift=
     }
 
@@ -1259,6 +1474,8 @@ function update_one_proposal()
     local proposal=$1
     local proposaltype=${2:-default}
 
+    echo -n "Starting proposal $proposal($proposaltype) at: "
+    date
     # hook for changing proposals:
     custom_configuration $proposal $proposaltype
     crowbar "$proposal" proposal commit $proposaltype
@@ -1268,6 +1485,8 @@ function update_one_proposal()
         waitnodes proposal $proposal $proposaltype
         ret=$?
         echo "Proposal exit code: $ret"
+        echo -n "Finished proposal $proposal($proposaltype) at: "
+        date
         sleep 10
     fi
     if [ $ret != 0 ] ; then
@@ -1293,16 +1512,20 @@ function onadmin_proposal()
     pre_hook $FUNCNAME
     waitnodes nodes
 
-    if [[ -n "$wantmultidns" ]]; then
+    if iscloudver 5plus; then
         update_one_proposal dns default
     fi
 
-    local proposals="database rabbitmq keystone ceph glance cinder $crowbar_networking nova nova_dashboard swift ceilometer heat trove tempest"
+    local proposals="pacemaker database rabbitmq keystone ceph glance cinder $crowbar_networking nova nova_dashboard swift ceilometer heat trove tempest"
 
     local proposal
     for proposal in $proposals ; do
         # proposal filter
         case "$proposal" in
+            pacemaker)
+                [ -n "$hacloud" ] || continue
+                cluster_node_assignment
+                ;;
             ceph)
                 [[ -n "$wantceph" ]] || continue
                 ;;
@@ -1319,6 +1542,11 @@ function onadmin_proposal()
 
         # create proposal
         case "$proposal" in
+            pacemaker)
+                for cluster in data services network ; do
+                    do_one_proposal "$proposal" "$cluster"
+                done
+                ;;
             *)
                 do_one_proposal "$proposal" "default"
                 ;;
@@ -1525,7 +1753,15 @@ EOH
             glance image-show SP3-64 | tee glance.out
         else
             # SP3-64 image not found, so uploading it
-            glance image-create --name=SP3-64 --is-public=True --property vm_mode=hvm --disk-format=qcow2 --container-format=bare --copy-from http://clouddata.cloud.suse.de/images/SP3-64up.qcow2 | tee glance.out
+            if [[ -n "$wanthyperv" ]] ; then
+                mount clouddata.cloud.suse.de:/srv/nfs/ /mnt/
+                zypper -n in virt-utils
+                qemu-img convert -O vpc /mnt/images/SP3-64up.qcow2 /tmp/SP3.vhd
+                glance --insecure image-create --name=SP3-64 --is-public=True --disk-format=vhd --container-format=bare --property hypervisor_type=hyperv --file /tmp/SP3.vhd | tee glance.out
+                rm /tmp/SP3.vhd ; umount /mnt
+            else
+                glance image-create --name=SP3-64 --is-public=True --property vm_mode=hvm --disk-format=qcow2 --container-format=bare --copy-from http://clouddata.cloud.suse.de/images/SP3-64up.qcow2 | tee glance.out
+            fi
         fi
 
         # wait for image to finish uploading
@@ -1639,9 +1875,10 @@ function onadmin_testsetup()
 {
     pre_hook $FUNCNAME
 
-    if [[ -n "$wantmultidns" ]]; then
+    if iscloudver 5plus; then
         cmachines=`crowbar machines list`
         for machine in $cmachines; do
+            knife node show $machine -a node.target_platform | grep -q suse- || continue
             ssh $machine 'dig multi-dns.'"'$cloudfqdn'"' | grep -q 10.11.12.13'
             if [ $? != 0 ]; then
                 echo "Multi DNS server test failed!"
@@ -1671,7 +1908,7 @@ function onadmin_testsetup()
         fi
     fi
 
-    scp $0 $novacontroller:
+    scp $0 $mkcconf $novacontroller:
     ssh $novacontroller "export wantswift=$wantswift ; export wantceph=$wantceph ; export wanttempest=$wanttempest ;
         export tempestoptions=\"$tempestoptions\" ; export cephmons=\"$cephmons\" ; export cephosds=\"$cephosds\" ;
         export cephradosgws=\"$cephradosgws\" ; export wantcephtestsuite=\"$wantcephtestsuite\" ;
@@ -2057,7 +2294,9 @@ function onadmin_cloudupgrade_2nd()
     crowbar provisioner proposal commit default
 
     # Install new features
-    if iscloudver 4; then
+    if iscloudver 5; then
+        update_one_proposal dns default
+    elif iscloudver 4; then
         zypper --non-interactive install crowbar-barclamp-trove
         do_one_proposal trove default
     elif iscloudver 3; then
@@ -2170,6 +2409,11 @@ function onadmin_teardown()
 ruby=/usr/bin/ruby
 iscloudver 5plus && ruby=/usr/bin/ruby.ruby2.1
 
+if [[ -n "$testfunc" ]] ; then
+    $testfunc "$@"
+    exit $?
+fi
+
 mount_localreposdir_target
 
 if [ -n "$prepareinstallcrowbar" ] ; then
@@ -2190,6 +2434,11 @@ fi
 
 if [ -n "$runupdate" ] ; then
     onadmin_runupdate
+fi
+
+set_proposalvars
+if [ -n "$allocate" ] ; then
+    onadmin_allocate
 fi
 
 if [ -n "$waitcompute" ] ; then
@@ -2217,10 +2466,6 @@ if [ -n "$cloudupgrade_reboot_and_redeploy_clients" ] ; then
 fi
 
 set_proposalvars
-if [ -n "$allocate" ] ; then
-    onadmin_allocate
-fi
-
 if [ -n "$proposal" ] ; then
     onadmin_proposal
 fi

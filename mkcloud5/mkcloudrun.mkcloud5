@@ -9,7 +9,6 @@ unset hacloud
 export cloudsource=develcloud5
 export libvirt_type=kvm
 export networkingplugin=openvswitch
-export cloudfqdn=c5.pranavws.suse.de
 
 export NOQACROWBARDOWNLOAD=1
 export hacloud=
@@ -27,12 +26,9 @@ export TESTHEAD=1
 #export compute_node_memory=8388608
 #export vcpus=8
 
-export cephvolumenumber=1
-export wantceph=1
-export want_sles12=1
 
 allocated_cloud=5
 
-. ../runtestn ${allocated_cloud}
+. ../mkcloudrun ${allocated_cloud}
 
-exec ../automation/scripts/mkcloud "$@"
+exec ../../automation/scripts/mkcloud "$@"

@@ -6,15 +6,14 @@ unset hacloud
 ###############################
 
 
-export cloudsource=develcloud5
+export cloudsource=develcloud4
 export libvirt_type=kvm
 export networkingplugin=openvswitch
-export cloudfqdn=c1.pranavws.suse.de
 
 export NOQACROWBARDOWNLOAD=1
 export hacloud=
 export nodenumber=3
-export TESTHEAD=1
+#export TESTHEAD=1
 #wget https://raw.githubusercontent.com/dguitarbite/automation/master/scripts/qa_crowbarsetup.sh
 ### Admin Node Processor and RAM configuration ###
 #export admin_node_memory=
@@ -27,12 +26,12 @@ export TESTHEAD=1
 #export compute_node_memory=8388608
 #export vcpus=8
 
-export cephvolumenumber=1
-export wantceph=1
-export want_sles12=1
+#export cephvolumenumber=1
+#export wantceph=1
+#export want_sles12=1
 
 allocated_cloud=1
 
-. ../runtestn ${allocated_cloud}
+. ../mkcloudrun ${allocated_cloud}
 
 exec ../../automation/scripts/mkcloud "$@"

@@ -6,11 +6,16 @@ test $(uname -m) = x86_64 || echo "ERROR: need 64bit"
 mkcconf=mkcloud.config
 [ -e $mkcconf ] && source $mkcconf
 
+# defaults
+: ${libvirt_type:=kvm}
+: ${networkingplugin:=openvswitch}
+
 novacontroller=
 novadashboardserver=
 clusternodesdata=
 clusternodesnetwork=
 clusternodesservices=
+wanthyperv=
 
 export cloud=${1}
 shift
@@ -25,6 +30,7 @@ export cinder_conf_volume_params=${cinder_conf_volume_params:-""}
 export localreposdir_target=${localreposdir_target:-""}
 export want_ipmi=${want_ipmi:-false}
 [ "$libvirt_type" = hyperv ] && export wanthyperv=1
+[ "$libvirt_type" = xen ] && export wantxenpv=1 # xenhvm is broken anyway
 
 [ -e /etc/profile.d/crowbar.sh ] && . /etc/profile.d/crowbar.sh
 
@@ -34,6 +40,12 @@ function complain() # {{{
     printf "Error: %s\n" "$@" >&2
     [[ $ex != - ]] && exit $ex
 } # }}}
+
+safely () {
+    if ! "$@"; then
+        complain 30 "$* failed! Aborting."
+    fi
+}
 
 if [ -z $cloud ] ; then
     echo "Error: Parameter missing that defines the cloud name"
@@ -58,6 +70,7 @@ case "$cloud" in
         want_ipmi=true
     ;;
     d2)
+        nodenumber=2
         net=$netp.186
         net_storage=$netp.187
         net_public=$netp.185
@@ -68,7 +81,7 @@ case "$cloud" in
         want_ipmi=true
     ;;
     d3)
-        nodenumber=2
+        nodenumber=3
         net=$netp.189
         net_public=$netp.188
         vlan_storage=586
@@ -236,7 +249,7 @@ function add_bind_mount()
     if ! grep -q "$src\s\+$dst" /etc/fstab ; then
         echo "$src $dst bind defaults,bind  0 0" >> /etc/fstab
     fi
-    mount "$dst"
+    safely mount "$dst"
 }
 
 function add_nfs_mount()
@@ -253,7 +266,7 @@ function add_nfs_mount()
     fi
 
     echo "$nfs $dir nfs    ro,nosuid,rsize=8192,wsize=8192,hard,intr,nolock  0 0" >> /etc/fstab
-    mount "$dir"
+    safely mount "$dir"
 }
 
 # mount a zypper repo either from NFS or from the host (if localreposdir_target is set)
@@ -274,8 +287,23 @@ function add_mount()
         [ -n "${nfssrc}" ] && add_nfs_mount "${nfssrc}" "${targetdir}"
     fi
     if [ -n "${zypper_alias}" ]; then
+        wait_for_if_running zypper
         zypper rr "${zypper_alias}"
-        zypper ar -f "${targetdir}" "${zypper_alias}"
+        wait_for_if_running zypper
+        safely zypper -n ar -f "${targetdir}" "${zypper_alias}"
+    fi
+}
+
+function getcloudver()
+{
+    if   [[ $cloudsource =~ ^.*(cloud|GM)3(\+up)?$ ]] ; then
+        echo -n 3
+    elif [[ $cloudsource =~ ^.*(cloud|GM)4(\+up)?$ ]] ; then
+        echo -n 4
+    elif [[ $cloudsource =~ ^(.+5|M[[:digit:]]+|Beta[[:digit:]]+|RC[[:digit:]]*|GMC[[:digit:]]*|GM5?)$ ]] ; then
+        echo -n 5
+    else
+        complain 11 "unknown cloudsource version"
     fi
 }
 
@@ -284,36 +312,37 @@ function add_mount()
 function iscloudver()
 {
     local v=$1
-    local bplus=""
+    local operator="="
     if [[ $v =~ plus ]] ; then
         v=${v%%plus}
-        bplus=$(($v+1))plus
+        operator="-ge"
     fi
-    case "$v" in
-        3)
-            [[ $cloudsource =~ ^.*(cloud|GM)3(\+up)?$ ]]
-            ;;
-        4)
-            [[ $cloudsource =~ ^.*(cloud|GM)4(\+up)?$ ]]
-            ;;
-        5)
-            [[ $cloudsource =~ ^(.+5|M[[:digit:]]+|Beta[[:digit:]]+|RC[[:digit:]]*|GMC[[:digit:]]*|GM5?)$ ]]
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-    [ $? = 0 ] && return 0
-    if [ -n "$bplus" ] ; then
-        iscloudver $bplus
-        return $?
+    local ver=`getcloudver` || exit 11
+    [ "$ver" $operator "$v" ]
+    return $?
+}
+
+function export_tftpboot_repos_dir()
+{
+    tftpboot_repos_dir=/srv/tftpboot/repos
+    tftpboot_suse_dir=/srv/tftpboot/suse-11.3
+
+    if iscloudver 5plus; then
+        tftpboot_suse12_dir=/srv/tftpboot/suse-12.0
+
+        if iscloudver 6plus || [[ ! $cloudsource =~ ^M[1-4]+$ ]]; then
+            tftpboot_repos_dir=$tftpboot_suse_dir/repos
+            tftpboot_repos12_dir=$tftpboot_suse12_dir/repos
+        else
+            # Cloud 5 M1 to M4 use the old-style paths
+            tftpboot_repos12_dir=/srv/tftpboot/repos
+        fi
     fi
-    return 1
 }
 
 function addsp3testupdates()
 {
-    add_mount "SLES11-SP3-Updates" 'you.suse.de:/you/http/download/x86_64/update/SLE-SERVER/11-SP3/' "/srv/tftpboot/repos/SLES11-SP3-Updates/" "sp3tup"
+    add_mount "SLES11-SP3-Updates" 'you.suse.de:/you/http/download/x86_64/update/SLE-SERVER/11-SP3/' "$tftpboot_repos_dir/SLES11-SP3-Updates/" "sp3tup"
 }
 function add_sles12ga_testupdates()
 {
@@ -322,42 +351,47 @@ function add_sles12ga_testupdates()
 
 function addcloud3maintupdates()
 {
-    add_mount "SUSE-Cloud-3-Updates" 'clouddata.cloud.suse.de:/srv/nfs/repos/SUSE-Cloud-3-Updates/' "/srv/tftpboot/repos/SUSE-Cloud-3-Updates/" "cloudmaintup"
+    add_mount "SUSE-Cloud-3-Updates" 'clouddata.cloud.suse.de:/srv/nfs/repos/SUSE-Cloud-3-Updates/' "$tftpboot_repos_dir/SUSE-Cloud-3-Updates/" "cloudmaintup"
 }
 
 function addcloud3testupdates()
 {
-    add_mount "SUSE-Cloud-3-Updates" 'you.suse.de:/you/http/download/x86_64/update/SUSE-CLOUD/3.0/' "/srv/tftpboot/repos/SUSE-Cloud-3-Updates/" "cloudtup"
+    add_mount "SUSE-Cloud-3-Updates" 'you.suse.de:/you/http/download/x86_64/update/SUSE-CLOUD/3.0/' "$tftpboot_repos_dir/SUSE-Cloud-3-Updates/" "cloudtup"
 }
 
 function addcloud4maintupdates()
 {
-    add_mount "SUSE-Cloud-4-Updates" 'clouddata.cloud.suse.de:/srv/nfs/repos/SUSE-Cloud-4-Updates/' "/srv/tftpboot/repos/SUSE-Cloud-4-Updates/" "cloudmaintup"
+    add_mount "SUSE-Cloud-4-Updates" 'clouddata.cloud.suse.de:/srv/nfs/repos/SUSE-Cloud-4-Updates/' "$tftpboot_repos_dir/SUSE-Cloud-4-Updates/" "cloudmaintup"
 }
 
 function addcloud4testupdates()
 {
-    add_mount "SUSE-Cloud-4-Updates" 'you.suse.de:/you/http/download/x86_64/update/SUSE-CLOUD/4/' "/srv/tftpboot/repos/SUSE-Cloud-4-Updates/" "cloudtup"
+    add_mount "SUSE-Cloud-4-Updates" 'you.suse.de:/you/http/download/x86_64/update/SUSE-CLOUD/4/' "$tftpboot_repos_dir/SUSE-Cloud-4-Updates/" "cloudtup"
 }
 
 function addcloud5maintupdates()
 {
-    add_mount "SUSE-Cloud-5-Updates" 'clouddata.cloud.suse.de:/srv/nfs/repos/SUSE-Cloud-5-Updates/' "/srv/tftpboot/repos/SUSE-Cloud-5-Updates/" "cloudmaintup"
+    add_mount "SUSE-Cloud-5-Updates" 'clouddata.cloud.suse.de:/srv/nfs/repos/SUSE-Cloud-5-Updates/' "$tftpboot_repos_dir/SUSE-Cloud-5-Updates/" "cloudmaintup"
 }
 
 function addcloud5testupdates()
 {
-    add_mount "SUSE-Cloud-5-Updates" 'you.suse.de:/you/http/download/x86_64/update/SUSE-CLOUD/5/' "/srv/tftpboot/repos/SUSE-Cloud-5-Updates/" "cloudtup"
+    add_mount "SUSE-Cloud-5-Updates" 'you.suse.de:/you/http/download/x86_64/update/SUSE-CLOUD/5/' "$tftpboot_repos_dir/SUSE-Cloud-5-Updates/" "cloudtup"
+}
+
+function addcloud5pool()
+{
+    add_mount "SUSE-Cloud-5-Pool" 'clouddata.cloud.suse.de:/srv/nfs/repos/SUSE-Cloud-5-Pool/' "$tftpboot_repos_dir/SUSE-Cloud-5-Pool/" "cloudpool"
 }
 
 function add_ha_repo()
 {
     local repo
-    for repo in "SLE11-HAE-SP3-Pool" "SLE11-HAE-SP3-Updates" "SLE11-HAE-SP3-Updates-test" ; do
+    for repo in SLE11-HAE-SP3-{Pool,Updates,Updates-test}; do
         if [ "$hacloud" == "2" && "$repo" == "SLE11-HAE-SP3-Updates-test" ] ; then
             continue
         fi
-        add_mount "" "clouddata.cloud.suse.de:/srv/nfs/repos/$repo" "/srv/tftpboot/repos/$repo"
+        add_mount "" "clouddata.cloud.suse.de:/srv/nfs/repos/$repo" "$tftpboot_repos_dir/$repo"
     done
 }
 
@@ -365,12 +399,25 @@ function add_suse_storage_repo()
 {
     if [ -n "$want_sles12" ] && iscloudver 5plus ; then
         local repo
-        for repo  in "SUSE-Enterprise-Storage-1.0-Pool" "SUSE-Enterprise-Storage-1.0-Updates"; do
-            add_mount "$repo" "clouddata.cloud.suse.de:/srv/nfs/repos/$repo" "/srv/tftpboot/repos/$repo"
+        for repo in SUSE-Enterprise-Storage-1.0-{Pool,Updates}; do
+            add_mount "$repo" "clouddata.cloud.suse.de:/srv/nfs/repos/$repo" "$tftpboot_repos12_dir/$repo"
         done
     else
         echo "Error: You need SLE12 and SUSE Cloud >= 5 to setup storage repos."
     fi
+}
+
+function get_disk_id_by_serial_and_libvirt_type()
+{
+    # default libvirt_type is "kvm"
+    local libvirt="${1:-kvm}"
+    local serial="$2"
+    diskid="unknown"
+    case "$libvirt" in
+        xen) diskid="scsi-SATA_QEMU_HARDDISK_$serial" ;;
+        kvm) diskid="virtio-$serial" ;;
+    esac
+    echo -n "$diskid"
 }
 
 function cluster_node_assignment()
@@ -400,7 +447,7 @@ function cluster_node_assignment()
                                 next if v.is_a? Hash and v['owner'] !~ /LVM_DRBD/;
                                 j['normal']['crowbar_wall']['claimed_disks'].delete(k);
                             end ;
-                            j['normal']['crowbar_wall']['claimed_disks']['/dev/disk/by-id/$serial']={'owner' => 'LVM_DRBD'};
+                            j['normal']['crowbar_wall']['claimed_disks']['/dev/disk/by-id/$(get_disk_id_by_serial_and_libvirt_type "$libvirt_type" "$serial")']={'owner' => 'LVM_DRBD'};
                             puts JSON.pretty_generate(j)" < $nfile > ${nfile}.tmp
                 mv ${nfile}.tmp ${nfile}
                 knife node from file ${nfile}
@@ -434,10 +481,11 @@ function cluster_node_assignment()
 
 function onadmin_prepare_sles_repos()
 {
-    local targetdir_install="/srv/tftpboot/suse-$suseversion/install/"
+    local targetdir_install="$tftpboot_suse_dir/install"
 
     if [ -n "${localreposdir_target}" ]; then
         add_mount "SUSE-Cloud-SLE-11-SP3-deps/sle-11-x86_64/" "" "${targetdir_install}" "Cloud-Deps"
+        zypper_refresh
     else
         zypper se -s sles-release|grep -v -e "sp.up\s*$" -e "(System Packages)" |grep -q x86_64 || zypper ar http://$susedownload/install/SLP/SLES-${slesversion}-LATEST/x86_64/DVD1/ sles
 
@@ -445,18 +493,19 @@ function onadmin_prepare_sles_repos()
             add_mount "" "clouddata.cloud.suse.de:/srv/nfs/suse-$suseversion/install" "${targetdir_install}"
         fi
 
-        local REPO
-        for REPO in $slesrepolist ; do
+        local repo
+        for repo in $slesrepolist ; do
             local zypprepo=""
-            [ "$WITHSLEUPDATES" != "" ] && zypprepo="$REPO"
-            add_mount "$zypprepo" "clouddata.cloud.suse.de:/srv/nfs/repos/$REPO" "/srv/tftpboot/repos/$REPO"
+            [ "$WITHSLEUPDATES" != "" ] && zypprepo="$repo"
+            add_mount "$zypprepo" "clouddata.cloud.suse.de:/srv/nfs/repos/$repo" \
+                "$tftpboot_repos_dir/$repo"
         done
 
         # just as a fallback if nfs did not work
         if [ ! -e "${targetdir_install}/media.1/" ] ; then
             local f=SLES-$slesversion-DVD-x86_64-$slesmilestone-DVD1.iso
-            local p=/srv/tftpboot/suse-$suseversion/$f
-            wget --progress=dot:mega -nc -O$p http://$susedownload/install/SLES-$slesversion-$slesmilestone/$f
+            local p=$tftpboot_suse_dir/$f
+            wget --progress=dot:mega -nc -O$p http://$susedownload/install/SLES-$slesversion-$slesmilestone/$f || complain 70 "iso not found"
             echo $p ${targetdir_install} iso9660 loop,ro >> /etc/fstab
             mount ${targetdir_install}
         fi
@@ -470,33 +519,36 @@ function onadmin_prepare_sles_repos()
 
 function rsync_iso()
 {
-    local CLOUDDISTPATH="$1"
-    local CLOUDDISTISO="$2"
+    local distpath="$1"
+    local distiso="$2"
     local targetdir="$3"
     mkdir -p /mnt/cloud "$targetdir"
     (
         cd "$targetdir"
-        wget --progress=dot:mega -r -np -nc -A "$CLOUDDISTISO" http://$susedownload$CLOUDDISTPATH/
-        local CLOUDISO=$(ls */$CLOUDDISTPATH/*.iso|tail -1)
-        mount -o loop,ro -t iso9660 $CLOUDISO /mnt/cloud
+        wget --progress=dot:mega -r -np -nc -A "$distiso" \
+            http://$susedownload$distpath/ \
+        || complain 71 "iso not found"
+        local cloudiso=$(ls */$distpath/*.iso|tail -1)
+        mount -o loop,ro -t iso9660 $cloudiso /mnt/cloud
         rsync -av --delete-after /mnt/cloud/ . ; umount /mnt/cloud
-        echo $CLOUDISO > isoversion
+        echo $cloudiso > isoversion
     )
 }
 
 function onadmin_prepare_sles12_repos()
 {
     suse12version=12.0
-    local targetdir_install="/srv/tftpboot/suse-$suse12version/install/"
-    local targetdir="/srv/tftpboot/repos/SLE12-Cloud-Compute"
+    local targetdir_install="$tftpboot_suse12_dir/install"
+    local targetdir="$tftpboot_repos12_dir/SLE12-Cloud-Compute"
 
     if ! $longdistance ; then
         add_mount "" "clouddata.cloud.suse.de:/srv/nfs/suse-12.0/install" "${targetdir_install}"
-    fi
 
-    for REPO in $sles12repolist ; do
-        add_mount "" "clouddata.cloud.suse.de:/srv/nfs/repos/$REPO" "/srv/tftpboot/repos/$REPO"
-    done
+        for repo in SLES12-Pool SLES12-Updates ; do
+            add_mount "" "clouddata.cloud.suse.de:/srv/nfs/repos/$repo" \
+                "$tftpboot_repos12_dir/$repo"
+        done
+    fi
 
     if [ -n "${localreposdir_target}" ]; then
         echo FIXME add_bind_mount "${localreposdir_target}/${CLOUDLOCALREPOS}/sle-11-x86_64/" "$targetdir"
@@ -505,23 +557,14 @@ function onadmin_prepare_sles12_repos()
     fi
 
     # create empty repository when there is none yet
-    zypper -n install createrepo
+    safely zypper -n install createrepo
     sles12optionalrepolist="SLE-12-Cloud-Compute5-Pool SLE-12-Cloud-Compute5-Updates SLE12-Cloud-Compute-PTF SLES12-Pool"
-    for REPO in $sles12optionalrepolist ; do
-        if [ ! -e "/srv/tftpboot/repos/$REPO/repodata/" ] ; then
-            mkdir "/srv/tftpboot/repos/$REPO"
-            createrepo "/srv/tftpboot/repos/$REPO"
+    for repo in $sles12optionalrepolist ; do
+        if [ ! -e "$tftpboot_repos12_dir/$repo/repodata/" ] ; then
+            mkdir -p "$tftpboot_repos12_dir/$repo"
+            safely createrepo "$tftpboot_repos12_dir/$repo"
         fi
     done
-
-    # just as a fallback if nfs did not work
-    if [ ! -e "${targetdir_install}/media.1/" ] ; then
-        local f=SLES-$slesversion-DVD-x86_64-$slesmilestone-DVD1.iso
-        local p=/srv/tftpboot/suse-$suse12version/$f
-        wget --progress=dot:mega -nc -O$p http://$susedownload/install/SLES-$slesversion-$slesmilestone/$f
-        echo $p ${targetdir_install} iso9660 loop,ro >> /etc/fstab
-        mount ${targetdir_install}
-    fi
 
     if [ ! -e "${targetdir_install}/media.1/" ] ; then
         echo "We do not have SLES12 install media - giving up"
@@ -531,7 +574,7 @@ function onadmin_prepare_sles12_repos()
 
 function onadmin_prepare_cloud_repos()
 {
-    local targetdir="/srv/tftpboot/repos/Cloud/"
+    local targetdir="$tftpboot_repos_dir/Cloud/"
     mkdir -p ${targetdir}
 
     if [ -n "${localreposdir_target}" ]; then
@@ -549,8 +592,52 @@ function onadmin_prepare_cloud_repos()
         exit 35
     fi
 
+    wait_for_if_running zypper
     zypper rr Cloud
-    zypper ar -f ${targetdir} Cloud
+    safely zypper ar -f ${targetdir} Cloud
+
+    if [ -n "$TESTHEAD" ] ; then
+        case "$cloudsource" in
+            GM3|GM3+up)
+                addsp3testupdates
+                addcloud3testupdates
+                ;;
+            GM4|GM4+up)
+                addsp3testupdates
+                addcloud4testupdates
+                ;;
+            susecloud5|GM5|GM5+up)
+                addsp3testupdates
+                add_sles12ga_testupdates
+                addcloud5testupdates
+                addcloud5pool
+                ;;
+            develcloud3|develcloud4)
+                addsp3testupdates
+                ;;
+            develcloud5)
+                addsp3testupdates
+                add_sles12ga_testupdates
+                addcloud5pool
+                ;;
+            *)
+                echo "no TESTHEAD repos defined for cloudsource=$cloudsource"
+                exit 26
+                ;;
+        esac
+    else
+        case "$cloudsource" in
+            GM3+up)
+                addcloud3maintupdates
+                ;;
+            GM4+up)
+                addcloud4maintupdates
+                ;;
+            susecloud5|GM5|GM5+up)
+                addcloud5pool
+                ;;
+        esac
+    fi
 }
 
 
@@ -622,8 +709,13 @@ function onadmin_set_source_variables()
         ;;
     esac
 
-    # FIXME SLES12-Pool should be here, but it seems to be broken now
-    sles12repolist="SLES12-Updates"
+}
+
+
+function zypper_refresh()
+{
+    # --no-gpg-checks for Devel:Cloud repo
+    safely zypper -v --gpg-auto-import-keys --no-gpg-checks -n ref
 }
 
 
@@ -658,7 +750,7 @@ EOF
     fi
 
     if [ -n "${localreposdir_target}" ]; then
-        for x in `seq 1 10` ; do
+        while zypper lr -e - | grep -q '^name='; do
             zypper rr 1
         done
     fi
@@ -680,54 +772,19 @@ EOF
         fi
     fi
 
-    if [ -n "$wantceph"] && [ -n "$want_sles12" ] && iscloudver 5plus; then
+    if [ -n "$wantceph" ] && [ -n "$want_sles12" ] && iscloudver 5plus; then
         add_suse_storage_repo
     fi
 
-    zypper -n install rsync netcat
+    wait_for_if_running zypper
+    safely zypper -n install rsync netcat
 
     # setup cloud repos for tftpboot and zypper
     onadmin_prepare_cloud_repos
 
-    if [ -n "$TESTHEAD" ] ; then
-        case "$cloudsource" in
-            GM3|GM3+up)
-                addsp3testupdates
-                addcloud3testupdates
-                ;;
-            GM4|GM4+up)
-                addsp3testupdates
-                addcloud4testupdates
-                ;;
-            susecloud5|GM5|GM5+up)
-                addsp3testupdates
-                add_sles12ga_testupdates
-                addcloud5testupdates
-                ;;
-            develcloud3|develcloud4)
-                addsp3testupdates
-                ;;
-            develcloud5)
-                addsp3testupdates
-                add_sles12ga_testupdates
-                ;;
-            *)
-                echo "no TESTHEAD repos defined for cloudsource=$cloudsource"
-                exit 26
-                ;;
-        esac
-    else
-        case "$cloudsource" in
-            GM3+up)
-                addcloud3maintupdates
-                ;;
-            GM4+up)
-                addcloud4maintupdates
-                ;;
-        esac
-    fi
-    # --no-gpg-checks for Devel:Cloud repo
-    zypper -v --gpg-auto-import-keys --no-gpg-checks -n ref
+
+    zypper_refresh
+
     zypper -n dup -r Cloud -r cloudtup || zypper -n dup -r Cloud
     # disable extra repos
     zypper mr -d sp3sdk
@@ -786,6 +843,11 @@ EOF
         /opt/dell/bin/json-edit -a attributes.network.networks.nova_floating.ranges.host.end -v $netp.167.191 $netfile
         # todo? broadcast
     fi
+    # Setup specific network configuration for d2 cloud
+    if [[ $cloud = d2 ]] ; then
+        /opt/dell/bin/json-edit -a attributes.network.mode -v dual $netfile
+        /opt/dell/bin/json-edit -a attributes.network.teaming.mode -r -v 5 $netfile
+    fi
 
     cp -a $netfile /etc/crowbar/network.json # new place since 2013-07-18
 
@@ -812,7 +874,6 @@ function do_installcrowbar()
 
     rm -f /tmp/chef-ready
     rpm -Va crowbar\*
-    export REPOS_SKIP_CHECKS="Cloud SUSE-Cloud-1.0-Pool SUSE-Cloud-1.0-Updates"
     # run in screen to not lose session in the middle when network is reconfigured:
     screen -d -m -L /bin/bash -c "$instcmd ; touch /tmp/chef-ready"
 
@@ -820,8 +881,8 @@ function do_installcrowbar()
         # prepare Hyper-V 2012 R2 PXE-boot env and export it via Samba:
         zypper -n in samba
         rsync -a clouddata.cloud.suse.de::cloud/hyperv-6.3 /srv/tftpboot/
-        chkconfig -a smb
-        chkconfig -a nmb
+        chkconfig smb on
+        chkconfig nmb on
         cat >> /etc/samba/smb.conf <<EOF
 [reminst]
         comment = MS Windows remote install
@@ -1030,7 +1091,7 @@ function onadmin_waitcompute()
     pre_hook $FUNCNAME
     local node
     for node in $(crowbar machines list | grep ^d) ; do
-        wait_for 180 10 "netcat -w 3 -z $node 3389 || sshtest $node rpm -q yast2-core" "node $node" "check_node_resolvconf $node; exit 12"
+        wait_for 200 10 "netcat -w 3 -z $node 3389 || sshtest $node rpm -q yast2-core" "node $node" "check_node_resolvconf $node; exit 12"
         echo "node $node ready"
     done
 }
@@ -1297,7 +1358,6 @@ function custom_configuration()
         ;;
         nova)
             # custom nova config of libvirt
-            [ -n "$libvirt_type" ] || libvirt_type='kvm';
             proposal_set_value nova default "['attributes']['nova']['libvirt_type']" "'$libvirt_type'"
             proposal_set_value nova default "['attributes']['nova']['use_migration']" "true"
             [[ "$libvirt_type" = xen ]] && sed -i -e "s/nova-multi-compute-$libvirt_type/nova-multi-compute-xxx/g; s/nova-multi-compute-kvm/nova-multi-compute-$libvirt_type/g; s/nova-multi-compute-xxx/nova-multi-compute-kvm/g" $pfile
@@ -1343,15 +1403,44 @@ function custom_configuration()
             if iscloudver 4plus; then
                 proposal_set_value neutron default "['attributes']['neutron']['use_lbaas']" "true"
             fi
-            if [ -n "$networkingmode" ] ; then
-                proposal_set_value neutron default "['attributes']['neutron']['networking_mode']" "'$networkingmode'"
+
+            # For Cloud > 5 M4, proposal attribute names changed
+            # TODO(toabctl): the milestone/cloud6 check can be removed when milestone 5 is released
+            if iscloudver 5 && [[ ! $cloudsource =~ ^M[1-4]+$ ]] || iscloudver 6plus; then
+                if [ "$networkingplugin" = "openvswitch" ] ; then
+                    proposal_set_value neutron default "['attributes']['neutron']['networking_plugin']" "'ml2'"
+                    proposal_set_value neutron default "['attributes']['neutron']['ml2_type_drivers']" "['gre','vlan']"
+                    proposal_set_value neutron default "['attributes']['neutron']['ml2_mechanism_drivers']" "['openvswitch']"
+                    proposal_set_value neutron default "['attributes']['neutron']['ml2_type_drivers_default_provider_network']" "'vlan'"
+                    proposal_set_value neutron default "['attributes']['neutron']['ml2_type_drivers_default_tenant_network']" "'gre'"
+                elif [ "$networkingplugin" = "linuxbridge" ] ; then
+                    proposal_set_value neutron default "['attributes']['neutron']['networking_plugin']" "'ml2'"
+                    proposal_set_value neutron default "['attributes']['neutron']['ml2_type_drivers']" "['vlan']"
+                    proposal_set_value neutron default "['attributes']['neutron']['ml2_mechanism_drivers']" "['linuxbridge']"
+                    proposal_set_value neutron default "['attributes']['neutron']['ml2_type_drivers_default_provider_network']" "'vlan'"
+                    proposal_set_value neutron default "['attributes']['neutron']['ml2_type_drivers_default_tenant_network']" "'vlan'"
+                else
+                    complain 106 "networkingplugin '$networkingplugin' not yet covered in mkcloud"
+                fi
+            else
+                if [ -n "$networkingmode" ] ; then
+                    proposal_set_value neutron default "['attributes']['neutron']['networking_mode']" "'$networkingmode'"
+                fi
+                if [ -n "$networkingplugin" ] ; then
+                    proposal_set_value neutron default "['attributes']['neutron']['networking_plugin']" "'$networkingplugin'"
+                fi
             fi
-            if [ -n "$networkingplugin" ] ; then
-                proposal_set_value neutron default "['attributes']['neutron']['networking_plugin']" "'$networkingplugin'"
-            fi
+
             if [[ $hacloud = 1 ]] ; then
                 proposal_set_value neutron default "['deployment']['neutron']['elements']['neutron-server']" "['cluster:network']"
                 proposal_set_value neutron default "['deployment']['neutron']['elements']['neutron-l3']" "['cluster:network']"
+            fi
+            if [[ "$networkingplugin" = "vmware" ]] ; then
+                proposal_set_value neutron default "['attributes']['neutron']['vmware']['user']" "'$nsx_user'"
+                proposal_set_value neutron default "['attributes']['neutron']['vmware']['password']" "'$nsx_password'"
+                proposal_set_value neutron default "['attributes']['neutron']['vmware']['controllers']" "'$nsx_controllers'"
+                proposal_set_value neutron default "['attributes']['neutron']['vmware']['tz_uuid']" "'$nsx_tz_uuid'"
+                proposal_set_value neutron default "['attributes']['neutron']['vmware']['l3_gw_uuid']" "'$nsx_l3_gw_uuid'"
             fi
         ;;
         swift)
@@ -1361,7 +1450,7 @@ function custom_configuration()
                 proposal_set_value swift default "['attributes']['swift']['ssl']['insecure']" "true"
                 proposal_set_value swift default "['attributes']['swift']['allow_versions']" "true"
                 proposal_set_value swift default "['attributes']['swift']['keystone_delay_auth_decision']" "true"
-                proposal_set_value swift default "['attributes']['swift']['middlewares']['crossdomain']['enabled']" "true"
+                iscloudver 3 || proposal_set_value swift default "['attributes']['swift']['middlewares']['crossdomain']['enabled']" "true"
                 proposal_set_value swift default "['attributes']['swift']['middlewares']['formpost']['enabled']" "true"
                 proposal_set_value swift default "['attributes']['swift']['middlewares']['staticweb']['enabled']" "true"
                 proposal_set_value swift default "['attributes']['swift']['middlewares']['tempurl']['enabled']" "true"
@@ -1431,6 +1520,8 @@ function custom_configuration()
     esac
 
     crowbar $proposal proposal --file=$pfile edit $proposaltype
+    local ret=$?
+    [ $ret != 0 ] && complain 88 "Error: 'crowbar $proposal proposal --file=$pfile edit $proposaltype' failed with exit code: $ret"
 }
 
 # set global variables to be used in and after proposal phase
@@ -1514,6 +1605,12 @@ function onadmin_proposal()
 
     if iscloudver 5plus; then
         update_one_proposal dns default
+    fi
+    if [ "$networkingplugin" = "vmware" ] && iscloudver 5plus ; then
+        cmachines=`crowbar machines list`
+        for machine in $cmachines; do
+            ssh $machine 'zypper mr -p 90 SLE-Cloud-PTF'
+        done
     fi
 
     local proposals="pacemaker database rabbitmq keystone ceph glance cinder $crowbar_networking nova nova_dashboard swift ceilometer heat trove tempest"
@@ -1605,270 +1702,188 @@ function addfloatingip()
 # uploads an image, create flavor, boots a VM, assigns a floating IP, ssh to VM, attach/detach volume
 function oncontroller_testsetup()
 {
-        . .openrc
-        export LC_ALL=C
-        if [[ -n $wantswift ]] ; then
-            zypper -n install python-swiftclient
-            swift stat
-            swift upload container1 .ssh/authorized_keys
-            swift list container1 || exit 33
+    . .openrc
+
+    export LC_ALL=C
+    if [[ -n $wantswift ]] ; then
+        zypper -n install python-swiftclient
+        swift stat
+        swift upload container1 .ssh/authorized_keys
+        swift list container1 || exit 33
+    fi
+
+    radosgwret=0
+    if [ "$wantradosgwtest" == 1 ] ; then
+
+        zypper -n install python-swiftclient
+
+        if ! swift post swift-test; then
+            echo "creating swift container failed"
+            radosgwret=1
         fi
 
-        radosgwret=0
-        if [ "$wantradosgwtest" == 1 ] ; then
-
-            zypper -n install python-swiftclient
-
-            if ! swift post swift-test; then
-                echo "creating swift container failed"
-                radosgwret=1
-            fi
-
-            if [ "$radosgwret" == 0 ] && ! swift list|grep -q swift-test; then
-                echo "swift-test container not found"
-                radosgwret=2
-            fi
-
-            if [ "$radosgwret" == 0 ] && ! swift delete swift-test; then
-                echo "deleting swift-test container failed"
-                radosgwret=3
-            fi
-
-            if [ "$radosgwret" == 0 ] ; then
-                # verify file content after uploading & downloading
-                swift upload swift-test .ssh/authorized_keys
-                swift download --output .ssh/authorized_keys-downloaded swift-test .ssh/authorized_keys
-                if ! cmp .ssh/authorized_keys .ssh/authorized_keys-downloaded; then
-                    echo "file is different content after download"
-                    radosgwret=4
-                fi
-            fi
-
-            if [ "$radosgwret" == 0 ] ; then
-                radosgw-admin user create --uid=rados --display-name=RadosGW --secret="secret" --access-key="access"
-
-                # test S3 access using python API
-                # using curl directly is complicated, see http://ceph.com/docs/master/radosgw/s3/authentication/
-                zypper -n install python-boto
-                python << EOF
-import boto
-import boto.s3.connection
-
-conn = boto.connect_s3(
-    aws_access_key_id = "access",
-    aws_secret_access_key = "secret",
-    host = "localhost",
-    port = 8080,
-    is_secure=False,
-    calling_format = boto.s3.connection.OrdinaryCallingFormat()
-)
-bucket = conn.create_bucket("test-s3-bucket")
-EOF
-
-                # check if test bucket exists using radosgw-admin API
-                if ! radosgw-admin bucket list|grep -q test-s3-bucket ; then
-                    echo "test-s3-bucket not found"
-                    radosgwret=5
-                fi
-            fi
+        if [ "$radosgwret" == 0 ] && ! swift list|grep -q swift-test; then
+            echo "swift-test container not found"
+            radosgwret=2
         fi
 
-        cephret=0
-        if [ -n "$wantceph" -a "$wantcephtestsuite" == 1 ] ; then
-            rpm -q git-core &> /dev/null || zypper -n install git-core
-
-            if test -d qa-automation; then
-                pushd qa-automation
-                git reset --hard
-                git pull
-            else
-                git clone git://git.suse.de/ceph/qa-automation.git
-                pushd qa-automation
-            fi
-
-            # write configuration files that we need
-            cat > setup.cfg <<EOH
-[env]
-loglevel = debug
-EOH
-
-            # test suite will expect node names without domain, and in the right
-            # order; since we will write them in reverse order, use a sort -r here
-            yaml_allnodes=`echo $cephmons $cephosds | sed "s/ /\n/g" | sed "s/\..*//g" | sort -ru`
-            yaml_mons=`echo $cephmons | sed "s/ /\n/g" | sed "s/\..*//g" | sort -ru`
-            yaml_osds=`echo $cephosds | sed "s/ /\n/g" | sed "s/\..*//g" | sort -ru`
-            # for radosgw, we only want one node, so enforce that
-            yaml_radosgw=`echo $cephradosgws | sed "s/ .*//g" | sed "s/\..*//g"`
-            ceph_version=`rpm -q --qf %{version} ceph`
-
-            sed -i "s/^ceph_version:.*/ceph_version: $ceph_version/g" yamldata/testcloud_sanity.yaml
-            sed -i "s/^radosgw_node:.*/radosgw_node: $yaml_radosgw/g" yamldata/testcloud_sanity.yaml
-            # client node is the same as the rados gw node, to make our life easier
-            sed -i "s/^clientnode:.*/clientnode: $yaml_radosgw/g" yamldata/testcloud_sanity.yaml
-
-            sed -i "/teuthida-4/d" yamldata/testcloud_sanity.yaml
-            for node in $yaml_allnodes; do
-                sed -i "/^allnodes:$/a - $node" yamldata/testcloud_sanity.yaml
-            done
-            for node in $yaml_mons; do
-                sed -i "/^initmons:$/a - $node" yamldata/testcloud_sanity.yaml
-            done
-            for node in $yaml_osds; do
-                sed -i "/^osds:$/a - $node:vdb2" yamldata/testcloud_sanity.yaml
-            done
-
-            # dependency for the test suite
-            rpm -q python-PyYAML &> /dev/null || zypper -n install python-PyYAML
-
-            if ! rpm -q python-nose &> /dev/null; then
-                zypper ar http://download.suse.de/ibs/Devel:/Cloud:/Shared:/11-SP3:/Update/standard/Devel:Cloud:Shared:11-SP3:Update.repo
-                zypper -n --gpg-auto-import-keys --no-gpg-checks install python-nose
-                zypper rr Devel_Cloud_Shared_11-SP3_Update
-            fi
-
-            nosetests testsuites/testcloud_sanity.py
-            cephret=$?
-
-            popd
+        if [ "$radosgwret" == 0 ] && ! swift delete swift-test; then
+            echo "deleting swift-test container failed"
+            radosgwret=3
         fi
 
-        # Run Tempest Smoketests if configured to do so
-        tempestret=0
-        if [ "$wanttempest" = "1" ]; then
-            # Upload a Heat-enabled image
-            glance image-list|grep -q SLE11SP3-x86_64-cfntools || glance image-create --name=SLE11SP3-x86_64-cfntools --is-public=True --disk-format=qcow2 --container-format=bare --copy-from http://clouddata.cloud.suse.de/images/SLES11-SP3-x86_64-cfntools.qcow2 | tee glance.out
-            imageid=`perl -ne "m/ id [ |]*([0-9a-f-]+)/ && print \\$1" glance.out`
-            crudini --set /etc/tempest/tempest.conf orchestration image_ref $imageid
-            pushd /var/lib/openstack-tempest-test
-            echo 1 > /proc/sys/kernel/sysrq
-            ./run_tempest.sh -N $tempestoptions 2>&1 | tee tempest.log
-            tempestret=${PIPESTATUS[0]}
-            /var/lib/openstack-tempest-test/bin/tempest_cleanup.sh || :
-            popd
-        fi
-        nova list
-        glance image-list
-
-        if glance image-list | grep -q SP3-64 ; then
-            glance image-show SP3-64 | tee glance.out
-        else
-            # SP3-64 image not found, so uploading it
-            if [[ -n "$wanthyperv" ]] ; then
-                mount clouddata.cloud.suse.de:/srv/nfs/ /mnt/
-                zypper -n in virt-utils
-                qemu-img convert -O vpc /mnt/images/SP3-64up.qcow2 /tmp/SP3.vhd
-                glance --insecure image-create --name=SP3-64 --is-public=True --disk-format=vhd --container-format=bare --property hypervisor_type=hyperv --file /tmp/SP3.vhd | tee glance.out
-                rm /tmp/SP3.vhd ; umount /mnt
-            else
-                glance image-create --name=SP3-64 --is-public=True --property vm_mode=hvm --disk-format=qcow2 --container-format=bare --copy-from http://clouddata.cloud.suse.de/images/SP3-64up.qcow2 | tee glance.out
+        if [ "$radosgwret" == 0 ] ; then
+            # verify file content after uploading & downloading
+            swift upload swift-test .ssh/authorized_keys
+            swift download --output .ssh/authorized_keys-downloaded swift-test .ssh/authorized_keys
+            if ! cmp .ssh/authorized_keys .ssh/authorized_keys-downloaded; then
+                echo "file is different content after download"
+                radosgwret=4
             fi
         fi
+    fi
 
-        # wait for image to finish uploading
+    # Run Tempest Smoketests if configured to do so
+    tempestret=0
+    if [ "$wanttempest" = "1" ]; then
+        # Upload a Heat-enabled image
+        glance image-list|grep -q SLE11SP3-x86_64-cfntools || glance image-create --name=SLE11SP3-x86_64-cfntools --is-public=True --disk-format=qcow2 --container-format=bare --copy-from http://clouddata.cloud.suse.de/images/SLES11-SP3-x86_64-cfntools.qcow2 | tee glance.out
         imageid=`perl -ne "m/ id [ |]*([0-9a-f-]+)/ && print \\$1" glance.out`
-        if [ "x$imageid" == "x" ]; then
-            echo "Error: Image ID for SP3-64 not found"
-            exit 37
-        fi
+        crudini --set /etc/tempest/tempest.conf orchestration image_ref $imageid
+        pushd /var/lib/openstack-tempest-test
+        echo 1 > /proc/sys/kernel/sysrq
+        ./run_tempest.sh -N $tempestoptions 2>&1 | tee tempest.log
+        tempestret=${PIPESTATUS[0]}
+        /var/lib/openstack-tempest-test/bin/tempest_cleanup.sh || :
+        popd
+    fi
+    nova list
+    glance image-list
 
-        for n in $(seq 1 200) ; do
-            glance image-show $imageid|grep status.*active && break
-            sleep 5
-        done
-
-        # wait for nova-manage to be successful
-        for n in $(seq 1 200) ;  do
-            test "$(nova-manage service list  | fgrep -cv -- \:\-\))" -lt 2 && break
-            sleep 1
-        done
-
-        nova flavor-delete m1.smaller || :
-        nova flavor-create m1.smaller 11 512 10 1
-        nova delete testvm  || :
-        nova keypair-add --pub_key /root/.ssh/id_rsa.pub testkey
-        nova secgroup-add-rule default icmp -1 -1 0.0.0.0/0
-        nova secgroup-add-rule default tcp 1 65535 0.0.0.0/0
-        nova secgroup-add-rule default udp 1 65535 0.0.0.0/0
-        nova boot --poll --image SP3-64 --flavor m1.smaller --key_name testkey testvm | tee boot.out
-        instanceid=`perl -ne "m/ id [ |]*([0-9a-f-]+)/ && print \\$1" boot.out`
-        nova show "$instanceid"
-        vmip=`nova show "$instanceid" | perl -ne "m/fixed.network [ |]*([0-9.]+)/ && print \\$1"`
-        echo "VM IP address: $vmip"
-        if [ -z "$vmip" ] ; then
-            tail -n 90 /var/log/nova/*
-            echo "Error: VM IP is empty. Exiting"
-            exit 38
+    if glance image-list | grep -q SP3-64 ; then
+        glance image-show SP3-64 | tee glance.out
+    else
+        # SP3-64 image not found, so uploading it
+        if [[ -n "$wanthyperv" ]] ; then
+            mount clouddata.cloud.suse.de:/srv/nfs/ /mnt/
+            zypper -n in virt-utils
+            qemu-img convert -O vpc /mnt/images/SP3-64up.qcow2 /tmp/SP3.vhd
+            glance --insecure image-create --name=SP3-64 --is-public=True --disk-format=vhd --container-format=bare --property hypervisor_type=hyperv --file /tmp/SP3.vhd | tee glance.out
+            rm /tmp/SP3.vhd ; umount /mnt
+        elif [[ -n "$wantxenpv" ]] ; then
+            glance --insecure image-create --name=SP3-64 --is-public=True --disk-format=qcow2 --container-format=bare --property hypervisor_type=xen --property vm_mode=xen --copy-from http://clouddata.cloud.suse.de/images/jeos-64-pv.qcow2 | tee glance.out
+        else
+            glance image-create --name=SP3-64 --is-public=True --property vm_mode=hvm --disk-format=qcow2 --container-format=bare --copy-from http://clouddata.cloud.suse.de/images/SP3-64up.qcow2 | tee glance.out
         fi
-        addfloatingip "$instanceid"
-        vmip=$floatingip
-        n=1000 ; while test $n -gt 0 && ! ping -q -c 1 -w 1 $vmip >/dev/null ; do
-            n=$(expr $n - 1)
-            echo -n .
-            set +x
-        done
-        set -x
-        if [ $n = 0 ] ; then
-            echo testvm boot or net failed
-            exit 94
-        fi
-        echo -n "Waiting for the VM to come up: "
-        n=500 ; while test $n -gt 0 && ! netcat -z $vmip 22 ; do
-            sleep 1
-            n=$(($n - 1))
-            echo -n "."
-            set +x
-        done
-        set -x
-        if [ $n = 0 ] ; then
-            echo "VM not accessible in reasonable time, exiting."
-            exit 96
-        fi
+    fi
 
+    # wait for image to finish uploading
+    imageid=`perl -ne "m/ id [ |]*([0-9a-f-]+)/ && print \\$1" glance.out`
+    if [ "x$imageid" == "x" ]; then
+        echo "Error: Image ID for SP3-64 not found"
+        exit 37
+    fi
+
+    for n in $(seq 1 200) ; do
+        glance image-show $imageid|grep status.*active && break
+        sleep 5
+    done
+
+    # wait for nova-manage to be successful
+    for n in $(seq 1 200) ;  do
+        test "$(nova-manage service list  | fgrep -cv -- \:\-\))" -lt 2 && break
+        sleep 1
+    done
+
+    nova flavor-delete m1.smaller || :
+    nova flavor-create m1.smaller 11 512 10 1
+    nova delete testvm  || :
+    nova keypair-add --pub_key /root/.ssh/id_rsa.pub testkey
+    nova secgroup-add-rule default icmp -1 -1 0.0.0.0/0
+    nova secgroup-add-rule default tcp 1 65535 0.0.0.0/0
+    nova secgroup-add-rule default udp 1 65535 0.0.0.0/0
+    nova boot --poll --image SP3-64 --flavor m1.smaller --key_name testkey testvm | tee boot.out
+    ret=${PIPESTATUS[0]}
+    [ $ret != 0 ] && complain 43 "nova boot failed"
+    instanceid=`perl -ne "m/ id [ |]*([0-9a-f-]+)/ && print \\$1" boot.out`
+    nova show "$instanceid"
+    vmip=`nova show "$instanceid" | perl -ne "m/fixed.network [ |]*([0-9.]+)/ && print \\$1"`
+    echo "VM IP address: $vmip"
+    if [ -z "$vmip" ] ; then
+        tail -n 90 /var/log/nova/*
+        echo "Error: VM IP is empty. Exiting"
+        exit 38
+    fi
+    addfloatingip "$instanceid"
+    vmip=$floatingip
+    n=1000 ; while test $n -gt 0 && ! ping -q -c 1 -w 1 $vmip >/dev/null ; do
+        n=$(expr $n - 1)
+        echo -n .
         set +x
-        echo "Waiting for the SSH keys to be copied over"
-        i=0
-        MAX_RETRIES=40
-        while timeout -k 20 10 ssh -o UserKnownHostsFile=/dev/null $vmip "echo cloud" 2> /dev/null; [ $? != 0 ]
-        do
-            sleep 5  # wait before retry
-            if [ $i -gt $MAX_RETRIES ] ; then
-                echo "VM not accessible via SSH, something could be wrong with SSH keys"
-                exit 97
-            fi
-            i=$((i+1))
-            echo -n "."
-        done
-        set -x
-        if ! ssh $vmip curl www3.zq1.de/test ; then
-            echo could not reach internet
-            exit 95
+    done
+    set -x
+    if [ $n = 0 ] ; then
+        echo testvm boot or net failed
+        exit 94
+    fi
+    echo -n "Waiting for the VM to come up: "
+    n=500 ; while test $n -gt 0 && ! netcat -z $vmip 22 ; do
+        sleep 1
+        n=$(($n - 1))
+        echo -n "."
+        set +x
+    done
+    set -x
+    if [ $n = 0 ] ; then
+        echo "VM not accessible in reasonable time, exiting."
+        exit 96
+    fi
+
+    set +x
+    echo "Waiting for the SSH keys to be copied over"
+    i=0
+    MAX_RETRIES=40
+    while timeout -k 20 10 ssh -o UserKnownHostsFile=/dev/null $vmip "echo cloud" 2> /dev/null; [ $? != 0 ]
+    do
+        sleep 5  # wait before retry
+        if [ $i -gt $MAX_RETRIES ] ; then
+            echo "VM not accessible via SSH, something could be wrong with SSH keys"
+            exit 97
         fi
-        nova volume-list | grep -q available || nova volume-create 1 ; sleep 2
-        nova volume-list | grep available
-        volumecreateret=$?
-        volumeid=`nova volume-list | perl -ne "m/^[ |]*([0-9a-f-]+) [ |]*available/ && print \\$1"`
-        nova volume-attach "$instanceid" "$volumeid" /dev/vdb
-        sleep 15
-        ssh $vmip fdisk -l /dev/vdb | grep 1073741824
-        volumeattachret=$?
-        rand=$RANDOM
-        ssh $vmip "mkfs.ext3 /dev/vdb && mount /dev/vdb /mnt && echo $rand > /mnt/test.txt && umount /mnt"
-        nova volume-detach "$instanceid" "$volumeid" ; sleep 10
-        nova volume-attach "$instanceid" "$volumeid" /dev/vdb ; sleep 10
-        ssh $vmip fdisk -l /dev/vdb | grep 1073741824 || volumeattachret=57
-        ssh $vmip "mount /dev/vdb /mnt && grep -q $rand /mnt/test.txt" || volumeattachret=58
-        # cleanup so that we can run testvm without leaking volumes, IPs etc
-        nova remove-floating-ip "$instanceid" "$floatingip"
-        nova floating-ip-delete "$floatingip"
-        nova stop "$instanceid"
-        wait_for 100 1 "test \"x\$(nova show \"$instanceid\" | perl -ne 'm/ status [ |]*([a-zA-Z]+)/ && print \$1')\" == xSHUTOFF" "testvm to stop"
+        i=$((i+1))
+        echo -n "."
+    done
+    set -x
+    if ! ssh $vmip curl www3.zq1.de/test ; then
+        echo could not reach internet
+        exit 95
+    fi
+    nova volume-list | grep -q available || nova volume-create 1 ; sleep 2
+    nova volume-list | grep available
+    volumecreateret=$?
+    volumeid=`nova volume-list | perl -ne "m/^[ |]*([0-9a-f-]+) [ |]*available/ && print \\$1"`
+    nova volume-attach "$instanceid" "$volumeid" /dev/vdb | tee volume-attach.out
+    device=`perl -ne "m!device [ |]*(/dev/\w+)! && print \\$1" volume-attach.out`
+    sleep 15
+    ssh $vmip fdisk -l $device | grep 1073741824
+    volumeattachret=$?
+    rand=$RANDOM
+    ssh $vmip "mkfs.ext3 -F $device && mount $device /mnt && echo $rand > /mnt/test.txt && umount /mnt"
+    nova volume-detach "$instanceid" "$volumeid" ; sleep 10
+    nova volume-attach "$instanceid" "$volumeid" /dev/vdb ; sleep 10
+    ssh $vmip fdisk -l $device | grep 1073741824 || volumeattachret=57
+    ssh $vmip "mount $device /mnt && grep -q $rand /mnt/test.txt" || volumeattachret=58
+    # cleanup so that we can run testvm without leaking volumes, IPs etc
+    nova remove-floating-ip "$instanceid" "$floatingip"
+    nova floating-ip-delete "$floatingip"
+    nova stop "$instanceid"
+    wait_for 100 1 "test \"x\$(nova show \"$instanceid\" | perl -ne 'm/ status [ |]*([a-zA-Z]+)/ && print \$1')\" == xSHUTOFF" "testvm to stop"
 
-        echo "Ceph Tests: $cephret"
-        echo "RadosGW Tests: $radosgwret"
-        echo "Tempest: $tempestret"
-        echo "Volume in VM: $volumecreateret & $volumeattachret"
+    echo "RadosGW Tests: $radosgwret"
+    echo "Tempest: $tempestret"
+    echo "Volume in VM: $volumecreateret & $volumeattachret"
 
-        test $cephret = 0 -a $tempestret = 0 -a $volumecreateret = 0 -a $volumeattachret = 0 -a $radosgwret = 0 || exit 102
+    test $tempestret = 0 -a $volumecreateret = 0 -a $volumeattachret = 0 -a $radosgwret = 0 || exit 102
 }
 
 function onadmin_testsetup()
@@ -1902,9 +1917,105 @@ function onadmin_testsetup()
         echo "ceph mons:" $cephmons
         echo "ceph osds:" $cephosds
         echo "ceph radosgw:" $cephradosgws
-        iscloudver 4plus && wantcephtestsuite=1
-        if [ -n "$cephradosgws" ] ; then
+        if iscloudver 4plus && [ -n "$cephradosgws" ] ; then
+            wantcephtestsuite=1
             wantradosgwtest=1
+        fi
+    fi
+
+    cephret=0
+    if [ -n "$wantceph" -a "$wantcephtestsuite" == 1 ] ; then
+        rpm -q git-core &> /dev/null || zypper -n install git-core
+
+        if test -d qa-automation; then
+            pushd qa-automation
+            git reset --hard
+            git pull
+        else
+            git clone git://git.suse.de/ceph/qa-automation.git
+            pushd qa-automation
+        fi
+
+        # write configuration files that we need
+        cat > setup.cfg <<EOH
+[env]
+loglevel = debug
+EOH
+
+        # test suite will expect node names without domain, and in the right
+        # order; since we will write them in reverse order, use a sort -r here
+        yaml_allnodes=`echo $cephmons $cephosds | sed "s/ /\n/g" | sed "s/\..*//g" | sort -ru`
+        yaml_mons=`echo $cephmons | sed "s/ /\n/g" | sed "s/\..*//g" | sort -ru`
+        yaml_osds=`echo $cephosds | sed "s/ /\n/g" | sed "s/\..*//g" | sort -ru`
+        # for radosgw, we only want one node, so enforce that
+        yaml_radosgw=`echo $cephradosgws | sed "s/ .*//g" | sed "s/\..*//g"`
+
+        set -- $yaml_mons
+        first_mon_node=$1
+        ceph_version=$(ssh $first_mon_node "rpm -q --qf %{version} ceph")
+
+        sed -i "s/^ceph_version:.*/ceph_version: $ceph_version/g" yamldata/testcloud_sanity.yaml
+        sed -i "s/^radosgw_node:.*/radosgw_node: $yaml_radosgw/g" yamldata/testcloud_sanity.yaml
+        # client node is the same as the rados gw node, to make our life easier
+        sed -i "s/^clientnode:.*/clientnode: $yaml_radosgw/g" yamldata/testcloud_sanity.yaml
+
+        sed -i "/teuthida-4/d" yamldata/testcloud_sanity.yaml
+        for node in $yaml_allnodes; do
+            sed -i "/^allnodes:$/a - $node" yamldata/testcloud_sanity.yaml
+        done
+        for node in $yaml_mons; do
+            sed -i "/^initmons:$/a - $node" yamldata/testcloud_sanity.yaml
+        done
+        for node in $yaml_osds; do
+            nodename=(vda1 vdb1 vdc1 vdd1 vde1)
+            for i in $(seq $cephvolumenumber); do
+                sed -i "/^osds:$/a - $node:${nodename[$i]}" yamldata/testcloud_sanity.yaml
+            done
+        done
+
+        # dependency for the test suite
+        wait_for_if_running zypper
+        rpm -q python-PyYAML &> /dev/null || zypper -n install python-PyYAML
+
+        if ! rpm -q python-nose &> /dev/null; then
+            zypper ar http://download.suse.de/ibs/Devel:/Cloud:/Shared:/11-SP3:/Update/standard/Devel:Cloud:Shared:11-SP3:Update.repo
+            zypper -n --gpg-auto-import-keys --no-gpg-checks install python-nose
+            zypper rr Devel_Cloud_Shared_11-SP3_Update
+        fi
+
+        nosetests testsuites/testcloud_sanity.py
+        cephret=$?
+
+        popd
+    fi
+
+    s3radosgwret=0
+    if [ "$wantradosgwtest" == 1 ] ; then
+        # test S3 access using python API
+        radosgw=`echo $cephradosgws | sed "s/ .*//g" | sed "s/\..*//g"`
+        ssh $radosgw radosgw-admin user create --uid=rados --display-name=RadosGW --secret="secret" --access-key="access"
+
+        # using curl directly is complicated, see http://ceph.com/docs/master/radosgw/s3/authentication/
+        zypper -n install python-boto
+        python << EOF
+import boto
+import boto.s3.connection
+
+conn = boto.connect_s3(
+        aws_access_key_id = "access",
+        aws_secret_access_key = "secret",
+        host = "$radosgw",
+        port = 8080,
+        is_secure=False,
+        calling_format = boto.s3.connection.OrdinaryCallingFormat()
+    )
+bucket = conn.create_bucket("test-s3-bucket")
+EOF
+
+        # check if test bucket exists using radosgw-admin API
+        if ! ssh $radosgw radosgw-admin bucket list|grep -q test-s3-bucket ; then
+            echo "test-s3-bucket not found"
+            s3radosgwret=1
         fi
     fi
 
@@ -1913,9 +2024,19 @@ function onadmin_testsetup()
         export tempestoptions=\"$tempestoptions\" ; export cephmons=\"$cephmons\" ; export cephosds=\"$cephosds\" ;
         export cephradosgws=\"$cephradosgws\" ; export wantcephtestsuite=\"$wantcephtestsuite\" ;
         export wantradosgwtest=\"$wantradosgwtest\" ; export cloudsource=\"$cloudsource\" ;
+        export libvirt_type=\"$libvirt_type\" ;
         oncontroller_testsetup=1 bash -x ./$0 $cloud"
     ret=$?
-    echo ret:$ret
+
+    echo "Tests on controller: $ret"
+    echo "Ceph Tests: $cephret"
+    echo "RadosGW S3 Tests: $s3radosgwret"
+
+    if [ $ret -eq 0 ]; then
+        test $s3radosgwret -eq 0 || ret=105
+        test $cephret -eq 0 || ret=104
+    fi
+
     if [ "$wanttempest" = "1" ]; then
         scp $novacontroller:"/var/lib/openstack-tempest-test/tempest.log" .
     fi
@@ -1926,7 +2047,7 @@ function onadmin_addupdaterepo()
 {
     pre_hook $FUNCNAME
 
-    local UPR=/srv/tftpboot/repos/Cloud-PTF
+    local UPR=$tftpboot_repos_dir/Cloud-PTF
     mkdir -p $UPR
 
     if [[ -n "$UPDATEREPOS" ]]; then
@@ -1934,10 +2055,10 @@ function onadmin_addupdaterepo()
         for repo in ${UPDATEREPOS//+/ } ; do
             wget --progress=dot:mega -r --directory-prefix $UPR --no-parent --no-clobber --accept x86_64.rpm,noarch.rpm $repo || exit 8
         done
-        zypper -n install createrepo
+        safely zypper -n install createrepo
         createrepo -o $UPR $UPR || exit 8
     fi
-    zypper ar $UPR cloud-ptf
+    safely zypper ar $UPR cloud-ptf
 }
 
 function onadmin_runupdate()
@@ -2243,6 +2364,9 @@ function prepare_cloudupgrade()
 
     export cloudsource=$upgrade_cloudsource
 
+    # Update new repo paths
+    export_tftpboot_repos_dir
+
     # Client nodes need to be up to date
     onadmin_cloudupgrade_clients
 
@@ -2263,6 +2387,11 @@ function prepare_cloudupgrade()
 
 function onadmin_cloudupgrade_1st()
 {
+    if iscloudver 5; then
+        # Workaround registration checks
+        echo "SUSE-Cloud-5-Pool SUSE-Cloud-5-Updates" > /etc/zypp/repos.d/ignore-repos
+    fi
+
     # Disable all openstack proposals stop service on the client
     echo 'y' | suse-cloud-upgrade upgrade
     local ret=$?
@@ -2293,23 +2422,13 @@ function onadmin_cloudupgrade_2nd()
     fi
     crowbar provisioner proposal commit default
 
-    # Install new features
-    if iscloudver 5; then
-        update_one_proposal dns default
-    elif iscloudver 4; then
-        zypper --non-interactive install crowbar-barclamp-trove
-        do_one_proposal trove default
-    elif iscloudver 3; then
-        zypper --non-interactive install crowbar-barclamp-tempest
-        do_one_proposal tempest default
-    fi
-
     # Allow vendor changes for packages as we might be updating an official
     # Cloud release to something form the Devel:Cloud projects. Note: On the
     # client nodes this needs to happen after the updated provisioner
     # proposal is applied since crudini is not part of older Cloud releases.
     for node in $(crowbar machines list | grep ^d) ; do
-        ssh $node "zypper --non-interactive --gpg-auto-import-keys --no-gpg-checks install crudini; crudini --set /etc/zypp/zypp.conf main solver.allowVendorChange true"
+        echo "Enabling VendorChange on $node"
+        timeout 60 ssh $node "zypper --non-interactive --gpg-auto-import-keys --no-gpg-checks install crudini; crudini --set /etc/zypp/zypp.conf main solver.allowVendorChange true"
     done
 }
 
@@ -2338,7 +2457,7 @@ function onadmin_cloudupgrade_reboot_and_redeploy_clients()
     sleep 60
     waitnodes nodes
 
-    # renable and apply the openstack propsals
+    # reenable and apply the openstack propsals
     for barclamp in pacemaker database rabbitmq keystone swift ceph glance cinder neutron nova nova_dashboard ceilometer heat ; do
         applied_proposals=$(crowbar "$barclamp" proposal list )
         if test "$applied_proposals" == "No current proposals"; then
@@ -2354,13 +2473,22 @@ function onadmin_cloudupgrade_reboot_and_redeploy_clients()
         done
     done
 
+    # Install new features
+    if iscloudver 5; then
+        update_one_proposal dns default
+        zypper --non-interactive install crowbar-barclamp-trove
+        do_one_proposal trove default
+    elif iscloudver 4; then
+        zypper --non-interactive install crowbar-barclamp-tempest
+        do_one_proposal tempest default
+    fi
 
     # TODO: restart any suspended instance?
 }
 
 function onadmin_qa_test()
 {
-    zypper -n in -y python-{keystone,nova,glance,heat,ceilometer}client
+    zypper -n in -y python-{keystone,nova,glance,heat,cinder,ceilometer}client
 
     get_novacontroller
     scp $novacontroller:.openrc ~/
@@ -2409,6 +2537,8 @@ function onadmin_teardown()
 ruby=/usr/bin/ruby
 iscloudver 5plus && ruby=/usr/bin/ruby.ruby2.1
 
+export_tftpboot_repos_dir
+
 if [[ -n "$testfunc" ]] ; then
     $testfunc "$@"
     exit $?
@@ -2416,6 +2546,7 @@ fi
 
 mount_localreposdir_target
 
+set_proposalvars
 if [ -n "$prepareinstallcrowbar" ] ; then
     onadmin_prepareinstallcrowbar
 fi
@@ -2436,7 +2567,6 @@ if [ -n "$runupdate" ] ; then
     onadmin_runupdate
 fi
 
-set_proposalvars
 if [ -n "$allocate" ] ; then
     onadmin_allocate
 fi

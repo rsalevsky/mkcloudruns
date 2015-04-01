@@ -6,13 +6,13 @@ unset hacloud
 ###############################
 
 
-export cloudsource=develcloud4
+export cloudsource=develcloud5
 export libvirt_type=kvm
-export networkingplugin=openvswitch
+export networkingplugin=linuxbridge
 
 export hacloud=
-export nodenumber=3
-export TESTHEAD=1
+export nodenumber=1
+export TESTHEAD=
 #wget https://raw.githubusercontent.com/dguitarbite/automation/master/scripts/qa_crowbarsetup.sh
 ### Admin Node Processor and RAM configuration ###
 #export admin_node_memory=

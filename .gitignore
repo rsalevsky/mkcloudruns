@@ -1,2 +1,3 @@
 *.*/
 mkcloud.pid
+qa_crowbarsetup.sh

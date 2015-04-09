@@ -6,15 +6,15 @@ unset hacloud
 ###############################
 
 
-export cloudsource=develcloud4
+export cloudsource=develcloud5
 export libvirt_type=kvm
 export networkingplugin=openvswitch
 
 export NOQACROWBARDOWNLOAD=1
 export hacloud=
-export nodenumber=3
-#export TESTHEAD=1
-#wget https://raw.githubusercontent.com/dguitarbite/automation/master/scripts/qa_crowbarsetup.sh
+export nodenumber=4
+export TESTHEAD=1
+
 ### Admin Node Processor and RAM configuration ###
 #export admin_node_memory=
 #export adminvcpus
@@ -26,7 +26,7 @@ export nodenumber=3
 #export compute_node_memory=8388608
 #export vcpus=8
 
-#export cephvolumenumber=1
+export cephvolumenumber=0
 #export wantceph=1
 #export want_sles12=1
 

@@ -8,12 +8,12 @@ unset hacloud
 
 export cloudsource=develcloud5
 export libvirt_type=kvm
-export networkingplugin=linuxbridge
+export networkingplugin=openvswitch
 
 export hacloud=
 export nodenumber=1
 export TESTHEAD=
-#wget https://raw.githubusercontent.com/dguitarbite/automation/master/scripts/qa_crowbarsetup.sh
+
 ### Admin Node Processor and RAM configuration ###
 #export admin_node_memory=
 #export adminvcpus
@@ -25,9 +25,7 @@ export TESTHEAD=
 #export compute_node_memory=8388608
 #export vcpus=8
 
-unset wantceph
-unset want_sles12
-unset cephvolumenumber
+export cephvolumenumber=0
 
 allocated_cloud=2
 

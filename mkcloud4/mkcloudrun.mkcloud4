@@ -8,7 +8,7 @@ unset hacloud
 
 export cloudsource=develcloud5
 export libvirt_type=kvm
-export networkingplugin=openvswitch
+export networkingplugin=linuxbridge
 
 export NOQACROWBARDOWNLOAD=1
 export hacloud=

@@ -35,3 +35,9 @@ libvirt.
   mkcloudrun file in this folder. Usually the formual is good to guess the
 required IP addresses.
 * Crowbar admin IP is at xxx.10.
+
+##RoadMap
+
+* Add manual hostname entires to /etc/hosts.
+* Add cleanup functionality.
+* Add offline support.

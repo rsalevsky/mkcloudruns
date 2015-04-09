@@ -6,11 +6,14 @@ unset hacloud
 ###############################
 
 
-export cloudsource=develcloud4
+export cloudsource=develcloud5
 export libvirt_type=kvm
-export networkingplugin=linuxbridge
-
-export hacloud=
+export networkingplugin=openvswitch
+export swift=1
+export deployswift=1
+export hacloud=1
+# For HA Cloud
+export clusterconfig="services+data=2:network=3"
 export nodenumber=3
 export TESTHEAD=1
 #wget https://raw.githubusercontent.com/dguitarbite/automation/master/scripts/qa_crowbarsetup.sh

@@ -1,3 +1,4 @@
 *.*/
 mkcloud.pid
 qa_crowbarsetup.sh
+mkcloud.config

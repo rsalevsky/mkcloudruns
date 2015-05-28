@@ -1,30 +1,16 @@
 #!/bin/bash
 
-unset NOQACROWBARDOWNLOAD
 unset TESTHEAD
-unset hacloud
 ###############################
 
 
 export cloudsource=develcloud5
 export libvirt_type=kvm
-export networkingplugin=linuxbridge
-
-export NOQACROWBARDOWNLOAD=1
-export hacloud=
-export nodenumber=3
+export networkingplugin=openvswitch
 export TESTHEAD=1
-#wget https://raw.githubusercontent.com/dguitarbite/automation/master/scripts/qa_crowbarsetup.sh
-### Admin Node Processor and RAM configuration ###
-#export admin_node_memory=
-#export adminvcpus
 
-### Controller Node Processor and RAM configuration ###
-#export controller_node_memory
+export nodenumber=3
 
-### Compute Node Processor and RAM configuration ###
-#export compute_node_memory=8388608
-#export vcpus=8
 allocated_cloud=4
 
 . ../mkcloudrun ${allocated_cloud}
